@@ -12,6 +12,10 @@
 #include <termios.h>
 #include <time.h>
 #include <unistd.h>
+#include <X11/Xatom.h>
+#include <X11/Xlib.h>
+#include <X11/Xutil.h>
+#include <X11/keysym.h>
 
 #define MAX_BANDS 64
 #define MIN_BANDS 4
@@ -65,6 +69,8 @@ typedef struct {
     int fps;
     int bands;
     int demo;
+    int terminal;
+    int fullscreen;
     snd_pcm_uframes_t frames;
 } Config;
 
@@ -79,6 +85,21 @@ typedef struct {
     int rows;
     int cols;
 } TermSize;
+
+typedef struct {
+    Display *display;
+    int screen;
+    Window window;
+    GC gc;
+    Atom wm_delete;
+    Atom net_wm_state;
+    Atom net_wm_state_fullscreen;
+    XImage *image;
+    uint32_t *pixels;
+    int width;
+    int height;
+    int fullscreen;
+} Graphics;
 
 static volatile sig_atomic_t g_running = 1;
 static volatile sig_atomic_t g_resized = 1;
@@ -182,12 +203,14 @@ static void print_usage(const char *argv0) {
             "  -f FPS     Max redraws per second, 1..60 (default: %d)\n"
             "  -b BANDS   EQ bands, %d..%d (default: %d)\n"
             "  -m         Demo mode: animate without ALSA or music\n"
+            "  -T         Terminal mode instead of graphical X11 mode\n"
+            "  -F         Start graphical mode fullscreen\n"
             "  -h         Show this help\n"
             "\n"
             "Examples:\n"
-            "  %s -d default -t tinyEffects\n"
             "  %s -m -t tinyEffects\n"
-            "  %s -d hw:Loopback,1,0 -t \"Now playing\"\n",
+            "  %s -F -m -t tinyEffects\n"
+            "  %s -T -d hw:Loopback,1,0 -t \"Now playing\"\n",
             argv0, DEFAULT_RATE, DEFAULT_FPS, MIN_BANDS, MAX_BANDS,
             DEFAULT_BANDS, argv0, argv0, argv0);
 }
@@ -202,9 +225,11 @@ static Config parse_args(int argc, char **argv) {
     cfg.fps = DEFAULT_FPS;
     cfg.bands = DEFAULT_BANDS;
     cfg.demo = 0;
+    cfg.terminal = 0;
+    cfg.fullscreen = 0;
     cfg.frames = DEFAULT_FRAMES;
 
-    while ((opt = getopt(argc, argv, "d:t:r:f:b:mh")) != -1) {
+    while ((opt = getopt(argc, argv, "d:t:r:f:b:mTFh")) != -1) {
         switch (opt) {
         case 'd':
             cfg.device = optarg;
@@ -223,6 +248,12 @@ static Config parse_args(int argc, char **argv) {
             break;
         case 'm':
             cfg.demo = 1;
+            break;
+        case 'T':
+            cfg.terminal = 1;
+            break;
+        case 'F':
+            cfg.fullscreen = 1;
             break;
         case 'h':
             print_usage(argv[0]);
@@ -769,7 +800,307 @@ static void draw_bar_mode(const Analyzer *analyzer, TermSize size, int clear) {
     }
 }
 
-static void render_frame(const Config *cfg, const Analyzer *analyzer) {
+static uint32_t rgb_color_for(double pos, double level) {
+    static const uint8_t dim[][3] = {
+        {20, 45, 100}, {15, 70, 120}, {25, 95, 60},
+        {110, 100, 25}, {130, 55, 20}, {110, 25, 25}
+    };
+    static const uint8_t hot[][3] = {
+        {50, 180, 255}, {50, 220, 255}, {80, 255, 110},
+        {255, 235, 70}, {255, 140, 40}, {255, 50, 45}
+    };
+    int index = (int)(pos * 5.999);
+    double mix = level;
+    int r;
+    int g;
+    int b;
+
+    if (index < 0) {
+        index = 0;
+    } else if (index > 5) {
+        index = 5;
+    }
+    if (mix < 0.0) {
+        mix = 0.0;
+    } else if (mix > 1.0) {
+        mix = 1.0;
+    }
+
+    r = (int)((double)dim[index][0] * (1.0 - mix) + (double)hot[index][0] * mix);
+    g = (int)((double)dim[index][1] * (1.0 - mix) + (double)hot[index][1] * mix);
+    b = (int)((double)dim[index][2] * (1.0 - mix) + (double)hot[index][2] * mix);
+    return (uint32_t)((r << 16) | (g << 8) | b);
+}
+
+static void graphics_destroy_image(Graphics *gfx) {
+    if (gfx->image) {
+        gfx->image->data = NULL;
+        XDestroyImage(gfx->image);
+        gfx->image = NULL;
+    }
+    free(gfx->pixels);
+    gfx->pixels = NULL;
+}
+
+static int graphics_resize(Graphics *gfx, int width, int height) {
+    if (width < 64) {
+        width = 64;
+    }
+    if (height < 48) {
+        height = 48;
+    }
+    if (gfx->pixels && gfx->width == width && gfx->height == height) {
+        return 0;
+    }
+
+    graphics_destroy_image(gfx);
+    gfx->pixels = calloc((size_t)width * (size_t)height, sizeof(*gfx->pixels));
+    if (!gfx->pixels) {
+        fprintf(stderr, "Out of memory for %dx%d graphics buffer\n", width, height);
+        return -1;
+    }
+
+    gfx->image = XCreateImage(gfx->display, DefaultVisual(gfx->display, gfx->screen),
+                              (unsigned int)DefaultDepth(gfx->display, gfx->screen),
+                              ZPixmap, 0, (char *)gfx->pixels, (unsigned int)width,
+                              (unsigned int)height, 32, 0);
+    if (!gfx->image) {
+        fprintf(stderr, "Cannot create X11 image\n");
+        free(gfx->pixels);
+        gfx->pixels = NULL;
+        return -1;
+    }
+
+    gfx->width = width;
+    gfx->height = height;
+    return 0;
+}
+
+static void graphics_set_fullscreen(Graphics *gfx, int enabled) {
+    XEvent event;
+
+    memset(&event, 0, sizeof(event));
+    event.xclient.type = ClientMessage;
+    event.xclient.window = gfx->window;
+    event.xclient.message_type = gfx->net_wm_state;
+    event.xclient.format = 32;
+    event.xclient.data.l[0] = enabled ? 1 : 0;
+    event.xclient.data.l[1] = (long)gfx->net_wm_state_fullscreen;
+    event.xclient.data.l[2] = 0;
+    XSendEvent(gfx->display, DefaultRootWindow(gfx->display), False,
+               SubstructureRedirectMask | SubstructureNotifyMask, &event);
+    gfx->fullscreen = enabled;
+}
+
+static int graphics_init(Graphics *gfx, const Config *cfg) {
+    memset(gfx, 0, sizeof(*gfx));
+    gfx->display = XOpenDisplay(NULL);
+    if (!gfx->display) {
+        fprintf(stderr, "Cannot open X11 display. Use -T for terminal mode.\n");
+        return -1;
+    }
+
+    gfx->screen = DefaultScreen(gfx->display);
+    gfx->width = 960;
+    gfx->height = 540;
+    gfx->window = XCreateSimpleWindow(gfx->display, RootWindow(gfx->display, gfx->screen),
+                                      100, 100, (unsigned int)gfx->width,
+                                      (unsigned int)gfx->height, 0,
+                                      BlackPixel(gfx->display, gfx->screen),
+                                      BlackPixel(gfx->display, gfx->screen));
+    XStoreName(gfx->display, gfx->window, "tinyEffects");
+    XSelectInput(gfx->display, gfx->window,
+                 ExposureMask | KeyPressMask | StructureNotifyMask);
+    gfx->gc = XCreateGC(gfx->display, gfx->window, 0, NULL);
+    gfx->wm_delete = XInternAtom(gfx->display, "WM_DELETE_WINDOW", False);
+    gfx->net_wm_state = XInternAtom(gfx->display, "_NET_WM_STATE", False);
+    gfx->net_wm_state_fullscreen = XInternAtom(gfx->display, "_NET_WM_STATE_FULLSCREEN", False);
+    XSetWMProtocols(gfx->display, gfx->window, &gfx->wm_delete, 1);
+
+    if (graphics_resize(gfx, gfx->width, gfx->height) < 0) {
+        XCloseDisplay(gfx->display);
+        memset(gfx, 0, sizeof(*gfx));
+        return -1;
+    }
+
+    XMapWindow(gfx->display, gfx->window);
+    XFlush(gfx->display);
+    if (cfg->fullscreen) {
+        graphics_set_fullscreen(gfx, 1);
+    }
+    return 0;
+}
+
+static void graphics_close(Graphics *gfx) {
+    graphics_destroy_image(gfx);
+    if (gfx->gc) {
+        XFreeGC(gfx->display, gfx->gc);
+    }
+    if (gfx->display) {
+        XDestroyWindow(gfx->display, gfx->window);
+        XCloseDisplay(gfx->display);
+    }
+    memset(gfx, 0, sizeof(*gfx));
+}
+
+static void graphics_events(Graphics *gfx) {
+    while (gfx->display && XPending(gfx->display) > 0) {
+        XEvent event;
+
+        XNextEvent(gfx->display, &event);
+        if (event.type == ClientMessage &&
+            (Atom)event.xclient.data.l[0] == gfx->wm_delete) {
+            g_running = 0;
+        } else if (event.type == ConfigureNotify) {
+            XConfigureEvent *cfg = &event.xconfigure;
+
+            if (cfg->width != gfx->width || cfg->height != gfx->height) {
+                if (graphics_resize(gfx, cfg->width, cfg->height) < 0) {
+                    g_running = 0;
+                }
+            }
+        } else if (event.type == KeyPress) {
+            KeySym key = XLookupKeysym(&event.xkey, 0);
+
+            if (key == XK_q || key == XK_Q || key == XK_Escape) {
+                g_running = 0;
+            } else if (key == XK_f || key == XK_F || key == XK_F11) {
+                graphics_set_fullscreen(gfx, !gfx->fullscreen);
+            }
+        }
+    }
+}
+
+static void put_rect(Graphics *gfx, int x, int y, int w, int h, uint32_t color) {
+    int yy;
+
+    if (x < 0) {
+        w += x;
+        x = 0;
+    }
+    if (y < 0) {
+        h += y;
+        y = 0;
+    }
+    if (x + w > gfx->width) {
+        w = gfx->width - x;
+    }
+    if (y + h > gfx->height) {
+        h = gfx->height - y;
+    }
+    if (w <= 0 || h <= 0) {
+        return;
+    }
+
+    for (yy = y; yy < y + h; yy++) {
+        uint32_t *row = gfx->pixels + (size_t)yy * (size_t)gfx->width + (size_t)x;
+        int xx;
+
+        for (xx = 0; xx < w; xx++) {
+            row[xx] = color;
+        }
+    }
+}
+
+static void render_graphics_text(Graphics *gfx, const Config *cfg, const Analyzer *analyzer) {
+    size_t len = strlen(cfg->text);
+    int base_width = text_base_width(cfg->text);
+    int scale = gfx->width / base_width;
+    int yscale = gfx->height / GLYPH_HEIGHT;
+    int rendered_width;
+    int rendered_height;
+    int x_start;
+    int y_start;
+    size_t i;
+    int x;
+
+    if (yscale < scale) {
+        scale = yscale;
+    }
+    if (scale < 1) {
+        scale = 1;
+    }
+
+    rendered_width = base_width * scale;
+    rendered_height = GLYPH_HEIGHT * scale;
+    x_start = gfx->width > rendered_width ? (gfx->width - rendered_width) / 2 : 0;
+    y_start = gfx->height > rendered_height ? (gfx->height - rendered_height) / 2 : 0;
+    x = x_start;
+
+    for (i = 0; i < len; i++) {
+        unsigned char ch = (unsigned char)cfg->text[i];
+        int glyph_width;
+        double pos = len == 1 ? 0.0 : (double)i / (double)(len - 1);
+        double level = level_at_position(analyzer, pos);
+        uint32_t color = rgb_color_for(pos, level);
+        const char **glyph;
+        int gy;
+
+        if (ch == '\n' || ch == '\r' || ch == '\t') {
+            ch = ' ';
+        }
+
+        glyph_width = ch == ' ' ? SPACE_WIDTH : GLYPH_WIDTH;
+        glyph = glyph_for(ch);
+
+        for (gy = 0; gy < GLYPH_HEIGHT; gy++) {
+            int gx;
+
+            for (gx = 0; gx < glyph_width; gx++) {
+                if (ch != ' ' && glyph[gy][gx] != ' ') {
+                    put_rect(gfx, x + gx * scale, y_start + gy * scale,
+                             scale, scale, color);
+                }
+            }
+        }
+
+        x += glyph_width * scale;
+        if (i + 1 < len) {
+            x += scale;
+        }
+    }
+}
+
+static void render_graphics_bars(Graphics *gfx, const Analyzer *analyzer) {
+    int bars = analyzer->bands;
+    int gap = gfx->width > 320 ? 2 : 1;
+    int bar_w = (gfx->width - (bars + 1) * gap) / bars;
+    int i;
+
+    if (bar_w < 1) {
+        bar_w = 1;
+        gap = 0;
+    }
+
+    for (i = 0; i < bars; i++) {
+        double pos = bars == 1 ? 0.0 : (double)i / (double)(bars - 1);
+        double level = analyzer->level[i];
+        int height = (int)(level * (double)(gfx->height - 12));
+        int x = gap + i * (bar_w + gap);
+        int y = gfx->height - height - 6;
+
+        put_rect(gfx, x, y, bar_w, height, rgb_color_for(pos, level));
+    }
+}
+
+static void render_graphics_frame(Graphics *gfx, const Config *cfg, const Analyzer *analyzer) {
+    if (!gfx->pixels || !gfx->image) {
+        return;
+    }
+
+    memset(gfx->pixels, 0, (size_t)gfx->width * (size_t)gfx->height * sizeof(*gfx->pixels));
+    if (cfg->text && cfg->text[0] != '\0') {
+        render_graphics_text(gfx, cfg, analyzer);
+    } else {
+        render_graphics_bars(gfx, analyzer);
+    }
+
+    XPutImage(gfx->display, gfx->window, gfx->gc, gfx->image, 0, 0, 0, 0,
+              (unsigned int)gfx->width, (unsigned int)gfx->height);
+    XFlush(gfx->display);
+}
+
+static void render_terminal_frame(const Config *cfg, const Analyzer *analyzer) {
     static TermSize size = {24, 80};
     TermSize current_size;
     TermSize draw_size;
@@ -860,6 +1191,7 @@ static int recover_pcm(snd_pcm_t *pcm, int err) {
 int main(int argc, char **argv) {
     Config cfg = parse_args(argc, argv);
     Analyzer analyzer;
+    Graphics gfx;
     snd_pcm_t *pcm = NULL;
     int16_t *samples = NULL;
     long next_render_ms;
@@ -890,8 +1222,17 @@ int main(int argc, char **argv) {
     }
 
     init_analyzer(&analyzer, cfg.bands, cfg.rate);
-    setvbuf(stdout, g_stdout_buffer, _IOFBF, sizeof(g_stdout_buffer));
-    setup_terminal();
+    memset(&gfx, 0, sizeof(gfx));
+    if (cfg.terminal) {
+        setvbuf(stdout, g_stdout_buffer, _IOFBF, sizeof(g_stdout_buffer));
+        setup_terminal();
+    } else if (graphics_init(&gfx, &cfg) < 0) {
+        free(samples);
+        if (pcm) {
+            g_alsa.pcm_close(pcm);
+        }
+        return 1;
+    }
 
     render_interval_ms = 1000 / cfg.fps;
     if (render_interval_ms < 1) {
@@ -903,13 +1244,22 @@ int main(int argc, char **argv) {
         long now = monotonic_ms();
 
         if (cfg.demo) {
+            if (!cfg.terminal) {
+                graphics_events(&gfx);
+            }
             if (now >= next_render_ms) {
                 animate_demo(&analyzer, now);
-                render_frame(&cfg, &analyzer);
+                if (cfg.terminal) {
+                    render_terminal_frame(&cfg, &analyzer);
+                } else {
+                    render_graphics_frame(&gfx, &cfg, &analyzer);
+                }
                 next_render_ms = now + render_interval_ms;
             }
 
-            poll_keyboard();
+            if (cfg.terminal) {
+                poll_keyboard();
+            }
             now = monotonic_ms();
             if (next_render_ms > now) {
                 long sleep_for = next_render_ms - now;
@@ -923,7 +1273,11 @@ int main(int argc, char **argv) {
 
         if (got < 0) {
             if (got == -EAGAIN) {
-                poll_keyboard();
+                if (cfg.terminal) {
+                    poll_keyboard();
+                } else {
+                    graphics_events(&gfx);
+                }
                 wait_for_audio(pcm, 20);
                 continue;
             }
@@ -936,7 +1290,11 @@ int main(int argc, char **argv) {
         }
 
         if (got == 0) {
-            poll_keyboard();
+            if (cfg.terminal) {
+                poll_keyboard();
+            } else {
+                graphics_events(&gfx);
+            }
             wait_for_audio(pcm, 20);
             continue;
         }
@@ -946,16 +1304,27 @@ int main(int argc, char **argv) {
         }
 
         if (now >= next_render_ms) {
-            render_frame(&cfg, &analyzer);
+            if (cfg.terminal) {
+                render_terminal_frame(&cfg, &analyzer);
+            } else {
+                render_graphics_frame(&gfx, &cfg, &analyzer);
+            }
             next_render_ms = now + render_interval_ms;
         }
 
-        poll_keyboard();
+        if (cfg.terminal) {
+            poll_keyboard();
+        } else {
+            graphics_events(&gfx);
+        }
     }
 
     free(samples);
     if (pcm) {
         g_alsa.pcm_close(pcm);
+    }
+    if (!cfg.terminal) {
+        graphics_close(&gfx);
     }
     return 0;
 }
