@@ -55,6 +55,18 @@ Run without music or an audio device using demo mode:
 ./tinyfx -m -t "tinyEffects"
 ```
 
+Use a built-in color palette:
+
+```sh
+./tinyfx -m -t "tinyEffects" --palette neon
+```
+
+Use custom color stops:
+
+```sh
+./tinyfx -m -t "tinyEffects" --colors '#001122,#44ccff,#ffffff'
+```
+
 Low frequencies drive the left side of the display. Higher frequencies drive
 progressively farther-right characters or bars.
 
@@ -72,8 +84,23 @@ In graphical mode, press `f` or `F11` to toggle fullscreen.
 -m         Demo mode: animate without ALSA or music
 -T         Terminal mode instead of graphical X11 mode
 -F         Start graphical mode fullscreen
+-p NAME    Palette: classic, fire, ice, matrix, mono, rainbow, neon
+-C COLORS  Custom #RRGGBB colors, comma-separated
 -h         Show help
 ```
+
+Long forms are also available for palettes:
+
+```sh
+--palette fire
+--palette neon
+--colors '#000000,#00ff00,#ffffff'
+```
+
+Palette colors are mapped left-to-right by frequency. Audio energy controls
+brightness, so quiet sections use a dim version of the same palette color.
+The `neon` palette is inspired by cyan, pink, magenta, purple, and white neon
+sign colors. `soundsvall` is accepted as an alias for `neon`.
 
 ## Capturing System Audio
 

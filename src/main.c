@@ -2,6 +2,7 @@
 #include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <getopt.h>
 #include <math.h>
 #include <signal.h>
 #include <stdint.h>
@@ -29,6 +30,7 @@
 #define GLYPH_WIDTH 5
 #define SPACE_WIDTH 3
 #define OUTPUT_BUFFER_SIZE (256 * 1024)
+#define MAX_PALETTE_STOPS 8
 #define PI 3.14159265358979323846
 
 #define SND_PCM_STREAM_CAPTURE 1
@@ -63,6 +65,18 @@ typedef struct {
 } AlsaApi;
 
 typedef struct {
+    uint8_t r;
+    uint8_t g;
+    uint8_t b;
+} Rgb;
+
+typedef struct {
+    const char *name;
+    int count;
+    Rgb stops[MAX_PALETTE_STOPS];
+} Palette;
+
+typedef struct {
     const char *device;
     const char *text;
     unsigned int rate;
@@ -71,6 +85,7 @@ typedef struct {
     int demo;
     int terminal;
     int fullscreen;
+    Palette palette;
     snd_pcm_uframes_t frames;
 } Config;
 
@@ -108,6 +123,38 @@ static int g_have_termios = 0;
 static int g_old_stdin_flags = -1;
 static AlsaApi g_alsa;
 static char g_stdout_buffer[OUTPUT_BUFFER_SIZE];
+
+static const Palette PALETTE_CLASSIC = {
+    "classic", 6,
+    {{50, 180, 255}, {50, 220, 255}, {80, 255, 110},
+     {255, 235, 70}, {255, 140, 40}, {255, 50, 45}}
+};
+static const Palette PALETTE_FIRE = {
+    "fire", 5,
+    {{30, 0, 0}, {130, 10, 0}, {230, 55, 0}, {255, 190, 30}, {255, 255, 210}}
+};
+static const Palette PALETTE_ICE = {
+    "ice", 5,
+    {{0, 12, 45}, {0, 65, 135}, {0, 180, 235}, {160, 240, 255}, {255, 255, 255}}
+};
+static const Palette PALETTE_MATRIX = {
+    "matrix", 4,
+    {{0, 18, 0}, {0, 95, 20}, {40, 210, 65}, {190, 255, 190}}
+};
+static const Palette PALETTE_MONO = {
+    "mono", 3,
+    {{20, 20, 20}, {150, 150, 150}, {255, 255, 255}}
+};
+static const Palette PALETTE_RAINBOW = {
+    "rainbow", 6,
+    {{90, 60, 255}, {0, 190, 255}, {30, 240, 80},
+     {255, 230, 40}, {255, 120, 20}, {255, 45, 120}}
+};
+static const Palette PALETTE_NEON = {
+    "neon", 6,
+    {{5, 5, 18}, {0, 200, 255}, {235, 245, 255},
+     {255, 90, 230}, {255, 0, 125}, {120, 40, 255}}
+};
 
 static void unload_alsa(void);
 
@@ -192,6 +239,112 @@ static long parse_long(const char *text, long min, long max, const char *name) {
     return value;
 }
 
+static int hex_value(char ch) {
+    if (ch >= '0' && ch <= '9') {
+        return ch - '0';
+    }
+    if (ch >= 'a' && ch <= 'f') {
+        return ch - 'a' + 10;
+    }
+    if (ch >= 'A' && ch <= 'F') {
+        return ch - 'A' + 10;
+    }
+    return -1;
+}
+
+static int parse_hex_color(const char *text, Rgb *out) {
+    int r1;
+    int r2;
+    int g1;
+    int g2;
+    int b1;
+    int b2;
+
+    if (strlen(text) != 7 || text[0] != '#') {
+        return -1;
+    }
+
+    r1 = hex_value(text[1]);
+    r2 = hex_value(text[2]);
+    g1 = hex_value(text[3]);
+    g2 = hex_value(text[4]);
+    b1 = hex_value(text[5]);
+    b2 = hex_value(text[6]);
+    if (r1 < 0 || r2 < 0 || g1 < 0 || g2 < 0 || b1 < 0 || b2 < 0) {
+        return -1;
+    }
+
+    out->r = (uint8_t)(r1 * 16 + r2);
+    out->g = (uint8_t)(g1 * 16 + g2);
+    out->b = (uint8_t)(b1 * 16 + b2);
+    return 0;
+}
+
+static void set_palette_by_name(Config *cfg, const char *name) {
+    const Palette *preset = NULL;
+
+    if (strcmp(name, "classic") == 0) {
+        preset = &PALETTE_CLASSIC;
+    } else if (strcmp(name, "fire") == 0) {
+        preset = &PALETTE_FIRE;
+    } else if (strcmp(name, "ice") == 0) {
+        preset = &PALETTE_ICE;
+    } else if (strcmp(name, "matrix") == 0) {
+        preset = &PALETTE_MATRIX;
+    } else if (strcmp(name, "mono") == 0) {
+        preset = &PALETTE_MONO;
+    } else if (strcmp(name, "rainbow") == 0) {
+        preset = &PALETTE_RAINBOW;
+    } else if (strcmp(name, "neon") == 0 || strcmp(name, "soundsvall") == 0) {
+        preset = &PALETTE_NEON;
+    }
+
+    if (!preset) {
+        fprintf(stderr, "Unknown palette '%s' (expected classic, fire, ice, matrix, mono, rainbow, neon)\n", name);
+        exit(2);
+    }
+
+    cfg->palette = *preset;
+}
+
+static void set_custom_palette(Config *cfg, const char *colors) {
+    const char *start = colors;
+    int count = 0;
+
+    memset(&cfg->palette, 0, sizeof(cfg->palette));
+    cfg->palette.name = "custom";
+
+    while (*start) {
+        char token[8];
+        const char *comma = strchr(start, ',');
+        size_t len = comma ? (size_t)(comma - start) : strlen(start);
+
+        if (len >= sizeof(token) || count >= MAX_PALETTE_STOPS) {
+            fprintf(stderr, "Invalid --colors value. Use 2-%d comma-separated #RRGGBB colors.\n", MAX_PALETTE_STOPS);
+            exit(2);
+        }
+
+        memcpy(token, start, len);
+        token[len] = '\0';
+        if (parse_hex_color(token, &cfg->palette.stops[count]) < 0) {
+            fprintf(stderr, "Invalid color '%s'. Use #RRGGBB.\n", token);
+            exit(2);
+        }
+        count++;
+
+        if (!comma) {
+            break;
+        }
+        start = comma + 1;
+    }
+
+    if (count < 2) {
+        fprintf(stderr, "--colors needs at least two #RRGGBB colors.\n");
+        exit(2);
+    }
+    cfg->palette.count = count;
+}
+
 static void print_usage(const char *argv0) {
     fprintf(stderr,
             "Usage: %s [options]\n"
@@ -205,11 +358,13 @@ static void print_usage(const char *argv0) {
             "  -m         Demo mode: animate without ALSA or music\n"
             "  -T         Terminal mode instead of graphical X11 mode\n"
             "  -F         Start graphical mode fullscreen\n"
+            "  -p NAME    Palette: classic, fire, ice, matrix, mono, rainbow, neon\n"
+            "  -C COLORS  Custom #RRGGBB colors, comma-separated\n"
             "  -h         Show this help\n"
             "\n"
             "Examples:\n"
             "  %s -m -t tinyEffects\n"
-            "  %s -F -m -t tinyEffects\n"
+            "  %s -F -m -t tinyEffects --palette fire\n"
             "  %s -T -d hw:Loopback,1,0 -t \"Now playing\"\n",
             argv0, DEFAULT_RATE, DEFAULT_FPS, MIN_BANDS, MAX_BANDS,
             DEFAULT_BANDS, argv0, argv0, argv0);
@@ -218,6 +373,20 @@ static void print_usage(const char *argv0) {
 static Config parse_args(int argc, char **argv) {
     Config cfg;
     int opt;
+    static const struct option long_options[] = {
+        {"device", required_argument, NULL, 'd'},
+        {"text", required_argument, NULL, 't'},
+        {"rate", required_argument, NULL, 'r'},
+        {"fps", required_argument, NULL, 'f'},
+        {"bands", required_argument, NULL, 'b'},
+        {"demo", no_argument, NULL, 'm'},
+        {"terminal", no_argument, NULL, 'T'},
+        {"fullscreen", no_argument, NULL, 'F'},
+        {"palette", required_argument, NULL, 'p'},
+        {"colors", required_argument, NULL, 'C'},
+        {"help", no_argument, NULL, 'h'},
+        {NULL, 0, NULL, 0}
+    };
 
     cfg.device = "default";
     cfg.text = NULL;
@@ -227,9 +396,10 @@ static Config parse_args(int argc, char **argv) {
     cfg.demo = 0;
     cfg.terminal = 0;
     cfg.fullscreen = 0;
+    cfg.palette = PALETTE_CLASSIC;
     cfg.frames = DEFAULT_FRAMES;
 
-    while ((opt = getopt(argc, argv, "d:t:r:f:b:mTFh")) != -1) {
+    while ((opt = getopt_long(argc, argv, "d:t:r:f:b:mTFp:C:h", long_options, NULL)) != -1) {
         switch (opt) {
         case 'd':
             cfg.device = optarg;
@@ -254,6 +424,12 @@ static Config parse_args(int argc, char **argv) {
             break;
         case 'F':
             cfg.fullscreen = 1;
+            break;
+        case 'p':
+            set_palette_by_name(&cfg, optarg);
+            break;
+        case 'C':
+            set_custom_palette(&cfg, optarg);
             break;
         case 'h':
             print_usage(argv[0]);
@@ -491,31 +667,167 @@ static double level_at_position(const Analyzer *analyzer, double pos) {
     return analyzer->level[left] * (1.0 - mix) + analyzer->level[right] * mix;
 }
 
-static int color_for(double pos, double level, int bright) {
-    static const int dim_palette[] = {24, 25, 28, 58, 94, 88};
-    static const int mid_palette[] = {39, 33, 40, 118, 214, 202};
-    static const int hot_palette[] = {45, 51, 46, 226, 208, 196};
-    int index = (int)(pos * 5.999);
-
-    if (index < 0) {
-        index = 0;
-    } else if (index > 5) {
-        index = 5;
-    }
-
-    if (level > 0.72 || bright) {
-        return hot_palette[index];
-    }
-    if (level > 0.28) {
-        return mid_palette[index];
-    }
-    return dim_palette[index];
-}
-
 static void write_repeat(char ch, int count) {
     while (count-- > 0) {
         fputc(ch, stdout);
     }
+}
+
+static Rgb palette_base_color(const Palette *palette, double pos) {
+    double scaled;
+    int left;
+    int right;
+    double mix;
+    Rgb out;
+
+    if (pos < 0.0) {
+        pos = 0.0;
+    } else if (pos > 1.0) {
+        pos = 1.0;
+    }
+
+    if (palette->count <= 1) {
+        return palette->stops[0];
+    }
+
+    scaled = pos * (double)(palette->count - 1);
+    left = (int)scaled;
+    right = left + 1;
+    if (right >= palette->count) {
+        right = palette->count - 1;
+    }
+    mix = scaled - (double)left;
+
+    out.r = (uint8_t)((double)palette->stops[left].r * (1.0 - mix) +
+                      (double)palette->stops[right].r * mix);
+    out.g = (uint8_t)((double)palette->stops[left].g * (1.0 - mix) +
+                      (double)palette->stops[right].g * mix);
+    out.b = (uint8_t)((double)palette->stops[left].b * (1.0 - mix) +
+                      (double)palette->stops[right].b * mix);
+    return out;
+}
+
+static int rgb_max_channel(Rgb color) {
+    int max = color.r;
+
+    if (color.g > max) {
+        max = color.g;
+    }
+    if (color.b > max) {
+        max = color.b;
+    }
+    return max;
+}
+
+static Rgb blend_rgb(Rgb a, Rgb b, double mix) {
+    Rgb out;
+
+    out.r = (uint8_t)((double)a.r * (1.0 - mix) + (double)b.r * mix);
+    out.g = (uint8_t)((double)a.g * (1.0 - mix) + (double)b.g * mix);
+    out.b = (uint8_t)((double)a.b * (1.0 - mix) + (double)b.b * mix);
+    return out;
+}
+
+static Rgb visible_palette_base_color(const Palette *palette, double pos) {
+    Rgb base = palette_base_color(palette, pos);
+    int max = rgb_max_channel(base);
+    int i;
+
+    if (max >= 42 || palette->count < 2) {
+        return base;
+    }
+
+    if (pos <= 0.5) {
+        for (i = 1; i < palette->count; i++) {
+            if (rgb_max_channel(palette->stops[i]) >= 42) {
+                return blend_rgb(base, palette->stops[i], 0.55);
+            }
+        }
+    } else {
+        for (i = palette->count - 2; i >= 0; i--) {
+            if (rgb_max_channel(palette->stops[i]) >= 42) {
+                return blend_rgb(base, palette->stops[i], 0.55);
+            }
+        }
+    }
+
+    return (Rgb){80, 80, 80};
+}
+
+static Rgb palette_color(const Palette *palette, double pos, double level) {
+    Rgb base = visible_palette_base_color(palette, pos);
+    double mix = level;
+    double dim = 0.18;
+    double gain;
+    Rgb out;
+
+    if (mix < 0.0) {
+        mix = 0.0;
+    } else if (mix > 1.0) {
+        mix = 1.0;
+    }
+
+    gain = dim + (1.0 - dim) * mix;
+    out.r = (uint8_t)((double)base.r * gain);
+    out.g = (uint8_t)((double)base.g * gain);
+    out.b = (uint8_t)((double)base.b * gain);
+    return out;
+}
+
+static uint32_t rgb_to_u32(Rgb color) {
+    return (uint32_t)((color.r << 16) | (color.g << 8) | color.b);
+}
+
+static int color_distance_sq(Rgb color, int r, int g, int b) {
+    int dr = (int)color.r - r;
+    int dg = (int)color.g - g;
+    int db = (int)color.b - b;
+
+    return dr * dr + dg * dg + db * db;
+}
+
+static int rgb_to_xterm256(Rgb color) {
+    static const int levels[] = {0, 95, 135, 175, 215, 255};
+    int r_index = (int)((color.r < 48) ? 0 : (color.r < 115 ? 1 : (color.r - 35) / 40));
+    int g_index = (int)((color.g < 48) ? 0 : (color.g < 115 ? 1 : (color.g - 35) / 40));
+    int b_index = (int)((color.b < 48) ? 0 : (color.b < 115 ? 1 : (color.b - 35) / 40));
+    int cube_index;
+    int cube_dist;
+    int gray_avg;
+    int gray_index;
+    int gray_value;
+    int gray_dist;
+
+    if (r_index > 5) {
+        r_index = 5;
+    }
+    if (g_index > 5) {
+        g_index = 5;
+    }
+    if (b_index > 5) {
+        b_index = 5;
+    }
+
+    cube_index = 16 + 36 * r_index + 6 * g_index + b_index;
+    cube_dist = color_distance_sq(color, levels[r_index], levels[g_index], levels[b_index]);
+
+    gray_avg = ((int)color.r + (int)color.g + (int)color.b) / 3;
+    gray_index = (gray_avg - 8 + 5) / 10;
+    if (gray_index < 0) {
+        gray_index = 0;
+    } else if (gray_index > 23) {
+        gray_index = 23;
+    }
+    gray_value = 8 + gray_index * 10;
+    gray_dist = color_distance_sq(color, gray_value, gray_value, gray_value);
+
+    return gray_dist < cube_dist ? 232 + gray_index : cube_index;
+}
+
+static int terminal_color_for(const Palette *palette, double pos, double level, int bright) {
+    double effective_level = bright && level < 0.85 ? 0.85 : level;
+
+    return rgb_to_xterm256(palette_color(palette, pos, effective_level));
 }
 
 static const char **glyph_for(unsigned char ch) {
@@ -681,7 +993,7 @@ static void draw_text_mode(const Config *cfg, const Analyzer *analyzer, TermSize
                 double pos = len == 1 ? 0.0 : (double)i / (double)(len - 1);
                 double level = level_at_position(analyzer, pos);
                 int bright = level > 0.72;
-                int color = color_for(pos, level, bright);
+                int color = terminal_color_for(&cfg->palette, pos, level, bright);
                 unsigned char fill;
                 const char **glyph;
                 int gx;
@@ -741,7 +1053,7 @@ static void draw_text_mode(const Config *cfg, const Analyzer *analyzer, TermSize
     }
 }
 
-static void draw_bar_mode(const Analyzer *analyzer, TermSize size, int clear) {
+static void draw_bar_mode(const Config *cfg, const Analyzer *analyzer, TermSize size, int clear) {
     int draw_cols = size.cols;
     int usable_rows = size.rows > 1 ? size.rows - 1 : 1;
     int row_start;
@@ -772,7 +1084,7 @@ static void draw_bar_mode(const Analyzer *analyzer, TermSize size, int clear) {
             double level = level_at_position(analyzer, pos);
             int height = (int)(level * usable_rows + 0.5);
             int filled = height >= threshold;
-            int color = filled ? color_for(pos, level, height == usable_rows) : -1;
+            int color = filled ? terminal_color_for(&cfg->palette, pos, level, height == usable_rows) : -1;
             int run = 1;
 
             while (col + run < draw_cols) {
@@ -780,7 +1092,7 @@ static void draw_bar_mode(const Analyzer *analyzer, TermSize size, int clear) {
                 double next_level = level_at_position(analyzer, next_pos);
                 int next_height = (int)(next_level * usable_rows + 0.5);
                 int next_filled = next_height >= threshold;
-                int next_color = next_filled ? color_for(next_pos, next_level, next_height == usable_rows) : -1;
+                int next_color = next_filled ? terminal_color_for(&cfg->palette, next_pos, next_level, next_height == usable_rows) : -1;
 
                 if (next_filled != filled || next_color != color) {
                     break;
@@ -798,38 +1110,6 @@ static void draw_bar_mode(const Analyzer *analyzer, TermSize size, int clear) {
             col += run;
         }
     }
-}
-
-static uint32_t rgb_color_for(double pos, double level) {
-    static const uint8_t dim[][3] = {
-        {20, 45, 100}, {15, 70, 120}, {25, 95, 60},
-        {110, 100, 25}, {130, 55, 20}, {110, 25, 25}
-    };
-    static const uint8_t hot[][3] = {
-        {50, 180, 255}, {50, 220, 255}, {80, 255, 110},
-        {255, 235, 70}, {255, 140, 40}, {255, 50, 45}
-    };
-    int index = (int)(pos * 5.999);
-    double mix = level;
-    int r;
-    int g;
-    int b;
-
-    if (index < 0) {
-        index = 0;
-    } else if (index > 5) {
-        index = 5;
-    }
-    if (mix < 0.0) {
-        mix = 0.0;
-    } else if (mix > 1.0) {
-        mix = 1.0;
-    }
-
-    r = (int)((double)dim[index][0] * (1.0 - mix) + (double)hot[index][0] * mix);
-    g = (int)((double)dim[index][1] * (1.0 - mix) + (double)hot[index][1] * mix);
-    b = (int)((double)dim[index][2] * (1.0 - mix) + (double)hot[index][2] * mix);
-    return (uint32_t)((r << 16) | (g << 8) | b);
 }
 
 static void graphics_destroy_image(Graphics *gfx) {
@@ -1032,7 +1312,7 @@ static void render_graphics_text(Graphics *gfx, const Config *cfg, const Analyze
         int glyph_width;
         double pos = len == 1 ? 0.0 : (double)i / (double)(len - 1);
         double level = level_at_position(analyzer, pos);
-        uint32_t color = rgb_color_for(pos, level);
+        uint32_t color = rgb_to_u32(palette_color(&cfg->palette, pos, level));
         const char **glyph;
         int gy;
 
@@ -1061,7 +1341,7 @@ static void render_graphics_text(Graphics *gfx, const Config *cfg, const Analyze
     }
 }
 
-static void render_graphics_bars(Graphics *gfx, const Analyzer *analyzer) {
+static void render_graphics_bars(Graphics *gfx, const Config *cfg, const Analyzer *analyzer) {
     int bars = analyzer->bands;
     int gap = gfx->width > 320 ? 2 : 1;
     int bar_w = (gfx->width - (bars + 1) * gap) / bars;
@@ -1079,7 +1359,7 @@ static void render_graphics_bars(Graphics *gfx, const Analyzer *analyzer) {
         int x = gap + i * (bar_w + gap);
         int y = gfx->height - height - 6;
 
-        put_rect(gfx, x, y, bar_w, height, rgb_color_for(pos, level));
+        put_rect(gfx, x, y, bar_w, height, rgb_to_u32(palette_color(&cfg->palette, pos, level)));
     }
 }
 
@@ -1092,7 +1372,7 @@ static void render_graphics_frame(Graphics *gfx, const Config *cfg, const Analyz
     if (cfg->text && cfg->text[0] != '\0') {
         render_graphics_text(gfx, cfg, analyzer);
     } else {
-        render_graphics_bars(gfx, analyzer);
+        render_graphics_bars(gfx, cfg, analyzer);
     }
 
     XPutImage(gfx->display, gfx->window, gfx->gc, gfx->image, 0, 0, 0, 0,
@@ -1124,7 +1404,7 @@ static void render_terminal_frame(const Config *cfg, const Analyzer *analyzer) {
     if (cfg->text && cfg->text[0] != '\0') {
         draw_text_mode(cfg, analyzer, draw_size, clear);
     } else {
-        draw_bar_mode(analyzer, draw_size, clear);
+        draw_bar_mode(cfg, analyzer, draw_size, clear);
     }
 
     fflush(stdout);
