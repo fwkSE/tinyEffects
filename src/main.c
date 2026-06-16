@@ -34,6 +34,8 @@
 #define LEVEL_ATTACK 0.72
 #define LEVEL_RELEASE 0.06
 #define LEVEL_FLOOR 0.003
+#define MOC_POLL_MS 1000
+#define MOC_LINE_MAX 512
 #define PI 3.14159265358979323846
 
 #define SND_PCM_STREAM_CAPTURE 1
@@ -82,6 +84,8 @@ typedef struct {
 typedef struct {
     const char *device;
     const char *text;
+    int moc;
+    char moc_line[MOC_LINE_MAX];
     unsigned int rate;
     int fps;
     int bands;
@@ -359,6 +363,7 @@ static void print_usage(const char *argv0) {
             "  -f FPS     Max redraws per second, 1..60 (default: %d)\n"
             "  -b BANDS   EQ bands, %d..%d (default: %d)\n"
             "  -m         Demo mode: animate without ALSA or music\n"
+            "  -M         Poll MOC (mocp) for \"Artist - Song\" text\n"
             "  -T         Terminal mode instead of graphical X11 mode\n"
             "  -F         Start graphical mode fullscreen\n"
             "  -p NAME    Palette: classic, fire, ice, matrix, mono, rainbow, neon\n"
@@ -368,9 +373,10 @@ static void print_usage(const char *argv0) {
             "Examples:\n"
             "  %s -m -t tinyEffects\n"
             "  %s -F -m -t tinyEffects --palette fire\n"
-            "  %s -T -d hw:Loopback,1,0 -t \"Now playing\"\n",
+            "  %s -T -d hw:Loopback,1,0 -t \"Now playing\"\n"
+            "  %s -M -d hw:Loopback,1,0 --palette neon\n",
             argv0, DEFAULT_RATE, DEFAULT_FPS, MIN_BANDS, MAX_BANDS,
-            DEFAULT_BANDS, argv0, argv0, argv0);
+            DEFAULT_BANDS, argv0, argv0, argv0, argv0);
 }
 
 static Config parse_args(int argc, char **argv) {
@@ -387,12 +393,15 @@ static Config parse_args(int argc, char **argv) {
         {"fullscreen", no_argument, NULL, 'F'},
         {"palette", required_argument, NULL, 'p'},
         {"colors", required_argument, NULL, 'C'},
+        {"moc", no_argument, NULL, 'M'},
         {"help", no_argument, NULL, 'h'},
         {NULL, 0, NULL, 0}
     };
 
     cfg.device = "default";
     cfg.text = NULL;
+    cfg.moc = 0;
+    cfg.moc_line[0] = '\0';
     cfg.rate = DEFAULT_RATE;
     cfg.fps = DEFAULT_FPS;
     cfg.bands = DEFAULT_BANDS;
@@ -402,7 +411,7 @@ static Config parse_args(int argc, char **argv) {
     cfg.palette = PALETTE_CLASSIC;
     cfg.frames = DEFAULT_FRAMES;
 
-    while ((opt = getopt_long(argc, argv, "d:t:r:f:b:mTFp:C:h", long_options, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "d:t:r:f:b:mTFMp:C:h", long_options, NULL)) != -1) {
         switch (opt) {
         case 'd':
             cfg.device = optarg;
@@ -421,6 +430,9 @@ static Config parse_args(int argc, char **argv) {
             break;
         case 'm':
             cfg.demo = 1;
+            break;
+        case 'M':
+            cfg.moc = 1;
             break;
         case 'T':
             cfg.terminal = 1;
@@ -448,6 +460,83 @@ static Config parse_args(int argc, char **argv) {
     }
 
     return cfg;
+}
+
+static void trim_string(char *text) {
+    size_t len;
+    char *start = text;
+    char *end;
+
+    while (*start != '\0' && isspace((unsigned char)*start)) {
+        start++;
+    }
+    if (start != text) {
+        memmove(text, start, strlen(start) + 1);
+    }
+
+    len = strlen(text);
+    end = text + len;
+    while (end > text && isspace((unsigned char)end[-1])) {
+        end--;
+    }
+    *end = '\0';
+}
+
+static const char *display_text(const Config *cfg) {
+    if (cfg->moc && cfg->moc_line[0] != '\0') {
+        return cfg->moc_line;
+    }
+    if (cfg->text != NULL && cfg->text[0] != '\0') {
+        return cfg->text;
+    }
+    return NULL;
+}
+
+static int poll_moc_metadata(Config *cfg) {
+    FILE *fp;
+    char line[MOC_LINE_MAX];
+
+    fp = popen("mocp -Q '%artist - %song' 2>/dev/null", "r");
+    if (!fp) {
+        return 0;
+    }
+
+    if (fgets(line, sizeof(line), fp) == NULL) {
+        pclose(fp);
+        return 0;
+    }
+    pclose(fp);
+
+    trim_string(line);
+    if (line[0] == '\0') {
+        if (cfg->moc_line[0] != '\0') {
+            cfg->moc_line[0] = '\0';
+            return 1;
+        }
+        return 0;
+    }
+
+    if (strcmp(line, cfg->moc_line) == 0) {
+        return 0;
+    }
+
+    strncpy(cfg->moc_line, line, sizeof(cfg->moc_line) - 1);
+    cfg->moc_line[sizeof(cfg->moc_line) - 1] = '\0';
+    return 1;
+}
+
+static void maybe_poll_moc(Config *cfg, long now_ms, long *last_poll_ms) {
+    if (!cfg->moc || last_poll_ms == NULL) {
+        return;
+    }
+    if (*last_poll_ms != 0 && now_ms - *last_poll_ms < MOC_POLL_MS) {
+        return;
+    }
+
+    if (poll_moc_metadata(cfg)) {
+        g_resized = 1;
+    }
+    *last_poll_ms = now_ms;
 }
 
 static void restore_terminal(void) {
@@ -945,7 +1034,8 @@ static int text_base_width(const char *text) {
 }
 
 static void draw_text_mode(const Config *cfg, const Analyzer *analyzer, TermSize size, int clear) {
-    size_t len = strlen(cfg->text);
+    const char *text = display_text(cfg);
+    size_t len;
     int base_width;
     int scale;
     int scale_x;
@@ -958,11 +1048,16 @@ static void draw_text_mode(const Config *cfg, const Analyzer *analyzer, TermSize
     int sy;
     size_t i;
 
+    if (text == NULL) {
+        return;
+    }
+
+    len = strlen(text);
     if (len == 0) {
         return;
     }
 
-    base_width = text_base_width(cfg->text);
+    base_width = text_base_width(text);
     scale = size.cols / base_width;
     if (size.rows / GLYPH_HEIGHT < scale) {
         scale = size.rows / GLYPH_HEIGHT;
@@ -993,7 +1088,7 @@ static void draw_text_mode(const Config *cfg, const Analyzer *analyzer, TermSize
 
             printf("\033[%d;%dH", row, col);
             for (i = 0; i < len; i++) {
-                unsigned char ch = (unsigned char)cfg->text[i];
+                unsigned char ch = (unsigned char)text[i];
                 int glyph_width;
                 double pos = len == 1 ? 0.0 : (double)i / (double)(len - 1);
                 double level = level_at_position(analyzer, pos);
@@ -1287,16 +1382,26 @@ static void put_rect(Graphics *gfx, int x, int y, int w, int h, uint32_t color) 
 }
 
 static void render_graphics_text(Graphics *gfx, const Config *cfg, const Analyzer *analyzer) {
-    size_t len = strlen(cfg->text);
-    int base_width = text_base_width(cfg->text);
-    int scale = gfx->width / base_width;
-    int yscale = gfx->height / GLYPH_HEIGHT;
+    const char *text = display_text(cfg);
+    size_t len;
+    int base_width;
+    int scale;
+    int yscale;
     int rendered_width;
     int rendered_height;
     int x_start;
     int y_start;
     size_t i;
     int x;
+
+    if (text == NULL || text[0] == '\0') {
+        return;
+    }
+
+    len = strlen(text);
+    base_width = text_base_width(text);
+    scale = gfx->width / base_width;
+    yscale = gfx->height / GLYPH_HEIGHT;
 
     if (yscale < scale) {
         scale = yscale;
@@ -1312,7 +1417,7 @@ static void render_graphics_text(Graphics *gfx, const Config *cfg, const Analyze
     x = x_start;
 
     for (i = 0; i < len; i++) {
-        unsigned char ch = (unsigned char)cfg->text[i];
+        unsigned char ch = (unsigned char)text[i];
         int glyph_width;
         double pos = len == 1 ? 0.0 : (double)i / (double)(len - 1);
         double level = level_at_position(analyzer, pos);
@@ -1373,7 +1478,7 @@ static void render_graphics_frame(Graphics *gfx, const Config *cfg, const Analyz
     }
 
     memset(gfx->pixels, 0, (size_t)gfx->width * (size_t)gfx->height * sizeof(*gfx->pixels));
-    if (cfg->text && cfg->text[0] != '\0') {
+    if (display_text(cfg) != NULL) {
         render_graphics_text(gfx, cfg, analyzer);
     } else {
         render_graphics_bars(gfx, cfg, analyzer);
@@ -1405,7 +1510,7 @@ static void render_terminal_frame(const Config *cfg, const Analyzer *analyzer) {
         draw_size.rows--;
     }
 
-    if (cfg->text && cfg->text[0] != '\0') {
+    if (display_text(cfg) != NULL) {
         draw_text_mode(cfg, analyzer, draw_size, clear);
     } else {
         draw_bar_mode(cfg, analyzer, draw_size, clear);
@@ -1479,6 +1584,7 @@ int main(int argc, char **argv) {
     snd_pcm_t *pcm = NULL;
     int16_t *samples = NULL;
     long next_render_ms;
+    long last_moc_poll_ms = 0;
     int render_interval_ms;
     int err;
 
@@ -1523,9 +1629,16 @@ int main(int argc, char **argv) {
         render_interval_ms = 1;
     }
     next_render_ms = monotonic_ms();
+    if (cfg.moc) {
+        maybe_poll_moc(&cfg, next_render_ms, &last_moc_poll_ms);
+    }
 
     while (g_running) {
         long now = monotonic_ms();
+
+        if (cfg.moc) {
+            maybe_poll_moc(&cfg, now, &last_moc_poll_ms);
+        }
 
         if (cfg.demo) {
             if (!cfg.terminal) {

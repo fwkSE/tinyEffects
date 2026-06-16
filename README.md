@@ -82,6 +82,7 @@ In graphical mode, press `f` or `F11` to toggle fullscreen.
 -f FPS     Max redraws per second, 1..60 (default: 15)
 -b BANDS   EQ bands, 4..64 (default: 24)
 -m         Demo mode: animate without ALSA or music
+-M         Poll MOC (mocp) for "Artist - Song" text
 -T         Terminal mode instead of graphical X11 mode
 -F         Start graphical mode fullscreen
 -p NAME    Palette: classic, fire, ice, matrix, mono, rainbow, neon
@@ -130,6 +131,22 @@ For the old terminal renderer, add `-T`:
 ```
 
 Exact loopback device numbers vary by machine and ALSA configuration.
+
+## MOC (Music On Console)
+
+If you use [MOC](https://moc.daper.net/) as your player, `tinyfx` can poll the
+current track with `-M` and display `Artist - Song` instead of fixed `-t` text:
+
+```sh
+./tinyfx -M -d hw:Loopback,1,0 --palette neon
+```
+
+`mocp` must be installed and the MOC server should already be running. Metadata
+is refreshed about once per second. When nothing is playing, `-M` falls back to
+`-t` text if you provided it, otherwise bar mode is shown.
+
+Route MOC playback through the same ALSA loopback or monitor device you use for
+the EQ capture side.
 
 ## Low-Resource Tuning
 
