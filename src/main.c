@@ -10,6 +10,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <sys/wait.h>
 #include <termios.h>
 #include <time.h>
 #include <unistd.h>
@@ -29,12 +30,14 @@
 #define GLYPH_HEIGHT 7
 #define GLYPH_WIDTH 5
 #define SPACE_WIDTH 3
-#define OUTPUT_BUFFER_SIZE (256 * 1024)
+#define DEFAULT_GFX_WIDTH 800
+#define DEFAULT_GFX_HEIGHT 450
+#define OUTPUT_BUFFER_SIZE (64 * 1024)
 #define MAX_PALETTE_STOPS 8
 #define LEVEL_ATTACK 0.72
 #define LEVEL_RELEASE 0.06
 #define LEVEL_FLOOR 0.003
-#define MOC_POLL_MS 1000
+#define MOC_POLL_MS 2500
 #define MOC_LINE_MAX 512
 #define PI 3.14159265358979323846
 
@@ -82,6 +85,14 @@ typedef struct {
 } Palette;
 
 typedef struct {
+    pid_t pid;
+    int fd;
+    char buf[MOC_LINE_MAX];
+    size_t len;
+    int active;
+} MocPoll;
+
+typedef struct {
     const char *device;
     const char *text;
     int moc;
@@ -97,9 +108,9 @@ typedef struct {
 } Config;
 
 typedef struct {
-    double coeff[MAX_BANDS];
-    double level[MAX_BANDS];
-    double peak[MAX_BANDS];
+    float coeff[MAX_BANDS];
+    float level[MAX_BANDS];
+    float peak[MAX_BANDS];
     int bands;
 } Analyzer;
 
@@ -130,6 +141,7 @@ static int g_have_termios = 0;
 static int g_old_stdin_flags = -1;
 static AlsaApi g_alsa;
 static char g_stdout_buffer[OUTPUT_BUFFER_SIZE];
+static MocPoll g_moc_poll = {-1, -1, {0}, 0, 0};
 
 static const Palette PALETTE_CLASSIC = {
     "classic", 6,
@@ -493,21 +505,22 @@ static const char *display_text(const Config *cfg) {
 }
 
 static int poll_moc_metadata(Config *cfg) {
-    FILE *fp;
     char line[MOC_LINE_MAX];
+    char *newline;
 
-    fp = popen("mocp -Q '%artist - %song' 2>/dev/null", "r");
-    if (!fp) {
-        return 0;
+    if (g_moc_poll.len >= sizeof(g_moc_poll.buf)) {
+        g_moc_poll.len = sizeof(g_moc_poll.buf) - 1;
     }
+    g_moc_poll.buf[g_moc_poll.len] = '\0';
 
-    if (fgets(line, sizeof(line), fp) == NULL) {
-        pclose(fp);
-        return 0;
+    strncpy(line, g_moc_poll.buf, sizeof(line) - 1);
+    line[sizeof(line) - 1] = '\0';
+    newline = strchr(line, '\n');
+    if (newline) {
+        *newline = '\0';
     }
-    pclose(fp);
-
     trim_string(line);
+
     if (line[0] == '\0') {
         if (cfg->moc_line[0] != '\0') {
             cfg->moc_line[0] = '\0';
@@ -525,18 +538,138 @@ static int poll_moc_metadata(Config *cfg) {
     return 1;
 }
 
+static void moc_poll_cancel(void) {
+    if (!g_moc_poll.active) {
+        return;
+    }
+
+    if (g_moc_poll.fd >= 0) {
+        close(g_moc_poll.fd);
+        g_moc_poll.fd = -1;
+    }
+    if (g_moc_poll.pid > 0) {
+        kill(g_moc_poll.pid, SIGTERM);
+        waitpid(g_moc_poll.pid, NULL, 0);
+        g_moc_poll.pid = -1;
+    }
+    g_moc_poll.len = 0;
+    g_moc_poll.buf[0] = '\0';
+    g_moc_poll.active = 0;
+}
+
+static void moc_poll_start(void) {
+    int pipefd[2];
+    pid_t pid;
+
+    if (g_moc_poll.active) {
+        return;
+    }
+
+    if (pipe(pipefd) != 0) {
+        return;
+    }
+
+    pid = vfork();
+    if (pid < 0) {
+        close(pipefd[0]);
+        close(pipefd[1]);
+        return;
+    }
+
+    if (pid == 0) {
+        int devnull;
+
+        close(pipefd[0]);
+        dup2(pipefd[1], STDOUT_FILENO);
+        devnull = open("/dev/null", O_WRONLY);
+        if (devnull >= 0) {
+            dup2(devnull, STDERR_FILENO);
+            close(devnull);
+        }
+        close(pipefd[1]);
+        execlp("mocp", "mocp", "-Q", "%artist - %song", (char *)NULL);
+        _exit(127);
+    }
+
+    close(pipefd[1]);
+    fcntl(pipefd[0], F_SETFL, fcntl(pipefd[0], F_GETFL, 0) | O_NONBLOCK);
+    g_moc_poll.pid = pid;
+    g_moc_poll.fd = pipefd[0];
+    g_moc_poll.len = 0;
+    g_moc_poll.buf[0] = '\0';
+    g_moc_poll.active = 1;
+}
+
+static int moc_poll_try_finish(Config *cfg) {
+    ssize_t got;
+    int status;
+    pid_t waited;
+
+    if (!g_moc_poll.active) {
+        return 0;
+    }
+
+    for (;;) {
+        size_t space = sizeof(g_moc_poll.buf) - 1;
+
+        if (g_moc_poll.len >= space) {
+            break;
+        }
+
+        got = read(g_moc_poll.fd, g_moc_poll.buf + g_moc_poll.len, space - g_moc_poll.len);
+        if (got > 0) {
+            g_moc_poll.len += (size_t)got;
+            continue;
+        }
+        if (got < 0 && errno == EINTR) {
+            continue;
+        }
+        break;
+    }
+
+    waited = waitpid(g_moc_poll.pid, &status, WNOHANG);
+    if (waited == 0) {
+        return 0;
+    }
+
+    if (g_moc_poll.fd >= 0) {
+        close(g_moc_poll.fd);
+        g_moc_poll.fd = -1;
+    }
+    g_moc_poll.pid = -1;
+    g_moc_poll.active = 0;
+
+    if (waited < 0) {
+        return 0;
+    }
+
+    return poll_moc_metadata(cfg);
+}
+
 static void maybe_poll_moc(Config *cfg, long now_ms, long *last_poll_ms) {
+    int changed;
+
     if (!cfg->moc || last_poll_ms == NULL) {
         return;
     }
+
+    changed = moc_poll_try_finish(cfg);
+    if (changed) {
+        g_resized = 1;
+    }
+
+    if (g_moc_poll.active) {
+        return;
+    }
+
     if (*last_poll_ms != 0 && now_ms - *last_poll_ms < MOC_POLL_MS) {
         return;
     }
 
-    if (poll_moc_metadata(cfg)) {
-        g_resized = 1;
+    moc_poll_start();
+    if (g_moc_poll.active) {
+        *last_poll_ms = now_ms;
     }
-    *last_poll_ms = now_ms;
 }
 
 static void restore_terminal(void) {
@@ -657,56 +790,64 @@ static void init_analyzer(Analyzer *analyzer, int bands, unsigned int rate) {
         double freq = min_freq * pow(ratio, pos);
         double omega = 2.0 * PI * freq / (double)rate;
 
-        analyzer->coeff[i] = 2.0 * cos(omega);
-        analyzer->peak[i] = 1.0e-9;
+        analyzer->coeff[i] = (float)(2.0 * cos(omega));
+        analyzer->peak[i] = 1.0e-9f;
     }
 }
 
 static void analyze_samples(Analyzer *analyzer, const int16_t *samples, int count) {
+    float q1[MAX_BANDS];
+    float q2[MAX_BANDS];
+    float count_f = (float)count;
     int band;
+    int i;
 
     for (band = 0; band < analyzer->bands; band++) {
-        double q0 = 0.0;
-        double q1 = 0.0;
-        double q2 = 0.0;
-        double power;
-        double normalized;
-        int i;
+        q1[band] = 0.0f;
+        q2[band] = 0.0f;
+    }
 
-        for (i = 0; i < count; i++) {
-            double sample = (double)samples[i] / 32768.0;
+    for (i = 0; i < count; i++) {
+        float sample = (float)samples[i] / 32768.0f;
 
-            q0 = analyzer->coeff[band] * q1 - q2 + sample;
-            q2 = q1;
-            q1 = q0;
+        for (band = 0; band < analyzer->bands; band++) {
+            float q0 = analyzer->coeff[band] * q1[band] - q2[band] + sample;
+
+            q2[band] = q1[band];
+            q1[band] = q0;
+        }
+    }
+
+    for (band = 0; band < analyzer->bands; band++) {
+        float power = q1[band] * q1[band] + q2[band] * q2[band] -
+                      analyzer->coeff[band] * q1[band] * q2[band];
+        float normalized;
+
+        if (power < 0.0f) {
+            power = 0.0f;
         }
 
-        power = q1 * q1 + q2 * q2 - analyzer->coeff[band] * q1 * q2;
-        if (power < 0.0) {
-            power = 0.0;
-        }
-
-        power = sqrt(power) / (double)count;
-        analyzer->peak[band] *= 0.995;
+        power = sqrtf(power) / count_f;
+        analyzer->peak[band] *= 0.995f;
         if (power > analyzer->peak[band]) {
             analyzer->peak[band] = power;
         }
 
-        normalized = analyzer->peak[band] > 1.0e-9 ? power / analyzer->peak[band] : 0.0;
-        if (normalized > 1.0) {
-            normalized = 1.0;
+        normalized = analyzer->peak[band] > 1.0e-9f ? power / analyzer->peak[band] : 0.0f;
+        if (normalized > 1.0f) {
+            normalized = 1.0f;
         }
 
         if (normalized > analyzer->level[band]) {
-            analyzer->level[band] = analyzer->level[band] * (1.0 - LEVEL_ATTACK) +
-                                    normalized * LEVEL_ATTACK;
+            analyzer->level[band] = analyzer->level[band] * (1.0f - (float)LEVEL_ATTACK) +
+                                    normalized * (float)LEVEL_ATTACK;
         } else {
-            analyzer->level[band] = analyzer->level[band] * (1.0 - LEVEL_RELEASE) +
-                                    normalized * LEVEL_RELEASE;
+            analyzer->level[band] = analyzer->level[band] * (1.0f - (float)LEVEL_RELEASE) +
+                                    normalized * (float)LEVEL_RELEASE;
         }
 
-        if (analyzer->level[band] < LEVEL_FLOOR) {
-            analyzer->level[band] = 0.0;
+        if (analyzer->level[band] < (float)LEVEL_FLOOR) {
+            analyzer->level[band] = 0.0f;
         }
     }
 }
@@ -731,11 +872,11 @@ static void animate_demo(Analyzer *analyzer, long now_ms) {
         }
 
         if (target > analyzer->level[band]) {
-            analyzer->level[band] = analyzer->level[band] * (1.0 - LEVEL_ATTACK) +
-                                    target * LEVEL_ATTACK;
+            analyzer->level[band] = analyzer->level[band] * (1.0f - (float)LEVEL_ATTACK) +
+                                    (float)target * (float)LEVEL_ATTACK;
         } else {
-            analyzer->level[band] = analyzer->level[band] * (1.0 - LEVEL_RELEASE) +
-                                    target * LEVEL_RELEASE;
+            analyzer->level[band] = analyzer->level[band] * (1.0f - (float)LEVEL_RELEASE) +
+                                    (float)target * (float)LEVEL_RELEASE;
         }
     }
 }
@@ -760,7 +901,7 @@ static double level_at_position(const Analyzer *analyzer, double pos) {
     }
     mix = scaled - (double)left;
 
-    return analyzer->level[left] * (1.0 - mix) + analyzer->level[right] * mix;
+    return (double)analyzer->level[left] * (1.0 - mix) + (double)analyzer->level[right] * mix;
 }
 
 static void write_repeat(char ch, int count) {
@@ -1280,8 +1421,8 @@ static int graphics_init(Graphics *gfx, const Config *cfg) {
     }
 
     gfx->screen = DefaultScreen(gfx->display);
-    gfx->width = 960;
-    gfx->height = 540;
+    gfx->width = DEFAULT_GFX_WIDTH;
+    gfx->height = DEFAULT_GFX_HEIGHT;
     gfx->window = XCreateSimpleWindow(gfx->display, RootWindow(gfx->display, gfx->screen),
                                       100, 100, (unsigned int)gfx->width,
                                       (unsigned int)gfx->height, 0,
@@ -1373,10 +1514,17 @@ static void put_rect(Graphics *gfx, int x, int y, int w, int h, uint32_t color) 
 
     for (yy = y; yy < y + h; yy++) {
         uint32_t *row = gfx->pixels + (size_t)yy * (size_t)gfx->width + (size_t)x;
-        int xx;
+        int xx = 0;
 
-        for (xx = 0; xx < w; xx++) {
+        while (xx + 4 <= w) {
             row[xx] = color;
+            row[xx + 1] = color;
+            row[xx + 2] = color;
+            row[xx + 3] = color;
+            xx += 4;
+        }
+        while (xx < w) {
+            row[xx++] = color;
         }
     }
 }
@@ -1433,13 +1581,23 @@ static void render_graphics_text(Graphics *gfx, const Config *cfg, const Analyze
         glyph = glyph_for(ch);
 
         for (gy = 0; gy < GLYPH_HEIGHT; gy++) {
+            int py = y_start + gy * scale;
             int gx;
 
-            for (gx = 0; gx < glyph_width; gx++) {
-                if (ch != ' ' && glyph[gy][gx] != ' ') {
-                    put_rect(gfx, x + gx * scale, y_start + gy * scale,
-                             scale, scale, color);
+            for (gx = 0; gx < glyph_width;) {
+                if (ch == ' ' || glyph[gy][gx] == ' ') {
+                    gx++;
+                    continue;
                 }
+
+                int run = 1;
+
+                while (gx + run < glyph_width && glyph[gy][gx + run] != ' ') {
+                    run++;
+                }
+
+                put_rect(gfx, x + gx * scale, py, run * scale, scale, color);
+                gx += run;
             }
         }
 
@@ -1463,7 +1621,7 @@ static void render_graphics_bars(Graphics *gfx, const Config *cfg, const Analyze
 
     for (i = 0; i < bars; i++) {
         double pos = bars == 1 ? 0.0 : (double)i / (double)(bars - 1);
-        double level = analyzer->level[i];
+        double level = (double)analyzer->level[i];
         int height = (int)(level * (double)(gfx->height - 12));
         int x = gap + i * (bar_w + gap);
         int y = gfx->height - height - 6;
@@ -1717,6 +1875,7 @@ int main(int argc, char **argv) {
     }
 
     free(samples);
+    moc_poll_cancel();
     if (pcm) {
         g_alsa.pcm_close(pcm);
     }

@@ -156,11 +156,40 @@ The defaults are intentionally modest:
 - `24` frequency bands
 - `15` FPS redraw cap
 - `512` sample processing windows
+- `800x450` default graphical window (resize as needed)
 - X11 software rendering with a single pixel buffer
 - terminal fallback bar rendering capped to `120x40` cells on large terminals
+- `64` KiB stdout buffer in terminal mode (not `256` KiB)
+- MOC metadata polled every `2.5` s via background `mocp` (non-blocking)
 
 On very slow machines, try lowering bands or FPS:
 
 ```sh
 ./tinyfx -b 12 -f 10 -t "tinyEffects"
 ```
+
+Build with size-focused flags (default in the Makefile):
+
+```sh
+make
+```
+
+On the target netbook you can also try:
+
+```sh
+make clean && make CFLAGS='-Os -pipe -march=atom'
+```
+
+### What costs CPU/RAM
+
+| Area | Cost | Notes |
+|------|------|-------|
+| EQ analysis | Medium | One audio pass per buffer; use `-b 12` if needed |
+| X11 redraw | High | Full `memset` + `XPutImage` every frame at `-f` FPS |
+| Text glyphs | High | Many filled rectangles when scale is large |
+| Terminal text | Medium | ANSI output; use graphical mode or `-f 10` |
+| MOC `-M` | Low | Async `vfork` + `mocp`; no main-loop blocking |
+| RAM | Low | ~1.4 MiB framebuffer at 800x450; scales with window size |
+
+Fullscreen on a 1024x600 panel uses more pixels than the default window.
+Lower `-f` or `-b` before resizing the window down if CPU is tight.
