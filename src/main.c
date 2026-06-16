@@ -31,6 +31,9 @@
 #define SPACE_WIDTH 3
 #define OUTPUT_BUFFER_SIZE (256 * 1024)
 #define MAX_PALETTE_STOPS 8
+#define LEVEL_ATTACK 0.72
+#define LEVEL_RELEASE 0.06
+#define LEVEL_FLOOR 0.003
 #define PI 3.14159265358979323846
 
 #define SND_PCM_STREAM_CAPTURE 1
@@ -606,12 +609,14 @@ static void analyze_samples(Analyzer *analyzer, const int16_t *samples, int coun
         }
 
         if (normalized > analyzer->level[band]) {
-            analyzer->level[band] = analyzer->level[band] * 0.55 + normalized * 0.45;
+            analyzer->level[band] = analyzer->level[band] * (1.0 - LEVEL_ATTACK) +
+                                    normalized * LEVEL_ATTACK;
         } else {
-            analyzer->level[band] = analyzer->level[band] * 0.84 + normalized * 0.16;
+            analyzer->level[band] = analyzer->level[band] * (1.0 - LEVEL_RELEASE) +
+                                    normalized * LEVEL_RELEASE;
         }
 
-        if (analyzer->level[band] < 0.01) {
+        if (analyzer->level[band] < LEVEL_FLOOR) {
             analyzer->level[band] = 0.0;
         }
     }
@@ -637,9 +642,11 @@ static void animate_demo(Analyzer *analyzer, long now_ms) {
         }
 
         if (target > analyzer->level[band]) {
-            analyzer->level[band] = analyzer->level[band] * 0.55 + target * 0.45;
+            analyzer->level[band] = analyzer->level[band] * (1.0 - LEVEL_ATTACK) +
+                                    target * LEVEL_ATTACK;
         } else {
-            analyzer->level[band] = analyzer->level[band] * 0.86 + target * 0.14;
+            analyzer->level[band] = analyzer->level[band] * (1.0 - LEVEL_RELEASE) +
+                                    target * LEVEL_RELEASE;
         }
     }
 }
@@ -824,10 +831,8 @@ static int rgb_to_xterm256(Rgb color) {
     return gray_dist < cube_dist ? 232 + gray_index : cube_index;
 }
 
-static int terminal_color_for(const Palette *palette, double pos, double level, int bright) {
-    double effective_level = bright && level < 0.85 ? 0.85 : level;
-
-    return rgb_to_xterm256(palette_color(palette, pos, effective_level));
+static int terminal_color_for(const Palette *palette, double pos, double level) {
+    return rgb_to_xterm256(palette_color(palette, pos, level));
 }
 
 static const char **glyph_for(unsigned char ch) {
@@ -992,8 +997,7 @@ static void draw_text_mode(const Config *cfg, const Analyzer *analyzer, TermSize
                 int glyph_width;
                 double pos = len == 1 ? 0.0 : (double)i / (double)(len - 1);
                 double level = level_at_position(analyzer, pos);
-                int bright = level > 0.72;
-                int color = terminal_color_for(&cfg->palette, pos, level, bright);
+                int color = terminal_color_for(&cfg->palette, pos, level);
                 unsigned char fill;
                 const char **glyph;
                 int gx;
@@ -1028,7 +1032,7 @@ static void draw_text_mode(const Config *cfg, const Analyzer *analyzer, TermSize
                     }
 
                     if (on) {
-                        printf("\033[%d;38;5;%dm", bright ? 1 : 2, color);
+                        printf("\033[38;5;%dm", color);
                         write_repeat((char)fill, cells);
                         fputs("\033[0m", stdout);
                     } else {
@@ -1084,7 +1088,7 @@ static void draw_bar_mode(const Config *cfg, const Analyzer *analyzer, TermSize 
             double level = level_at_position(analyzer, pos);
             int height = (int)(level * usable_rows + 0.5);
             int filled = height >= threshold;
-            int color = filled ? terminal_color_for(&cfg->palette, pos, level, height == usable_rows) : -1;
+            int color = filled ? terminal_color_for(&cfg->palette, pos, level) : -1;
             int run = 1;
 
             while (col + run < draw_cols) {
@@ -1092,7 +1096,7 @@ static void draw_bar_mode(const Config *cfg, const Analyzer *analyzer, TermSize 
                 double next_level = level_at_position(analyzer, next_pos);
                 int next_height = (int)(next_level * usable_rows + 0.5);
                 int next_filled = next_height >= threshold;
-                int next_color = next_filled ? terminal_color_for(&cfg->palette, next_pos, next_level, next_height == usable_rows) : -1;
+                int next_color = next_filled ? terminal_color_for(&cfg->palette, next_pos, next_level) : -1;
 
                 if (next_filled != filled || next_color != color) {
                     break;
