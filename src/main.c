@@ -1,3 +1,21 @@
+/*
+ * tinyEffects (tinyfx) — minimal ALSA EQ visualizer for low-resource Linux.
+ * Copyright (C) 2026 tinyEffects contributors
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
 #include <ctype.h>
 #include <dlfcn.h>
 #include <errno.h>
@@ -34,9 +52,10 @@
 #define DEFAULT_GFX_HEIGHT 450
 #define OUTPUT_BUFFER_SIZE (64 * 1024)
 #define MAX_PALETTE_STOPS 8
-#define LEVEL_ATTACK 0.72
-#define LEVEL_RELEASE 0.06
-#define LEVEL_FLOOR 0.003
+#define LEVEL_ATTACK 0.38f
+#define LEVEL_RELEASE 0.042f
+#define LEVEL_FLOOR 0.002f
+#define PEAK_DECAY 0.9985f
 #define MOC_POLL_MS 2500
 #define MOC_LINE_MAX 512
 #define PI 3.14159265358979323846
@@ -109,6 +128,7 @@ typedef struct {
 
 typedef struct {
     float coeff[MAX_BANDS];
+    float target[MAX_BANDS];
     float level[MAX_BANDS];
     float peak[MAX_BANDS];
     int bands;
@@ -314,7 +334,7 @@ static void set_palette_by_name(Config *cfg, const char *name) {
         preset = &PALETTE_MONO;
     } else if (strcmp(name, "rainbow") == 0) {
         preset = &PALETTE_RAINBOW;
-    } else if (strcmp(name, "neon") == 0 || strcmp(name, "soundsvall") == 0) {
+    } else if (strcmp(name, "neon") == 0) {
         preset = &PALETTE_NEON;
     }
 
@@ -828,7 +848,7 @@ static void analyze_samples(Analyzer *analyzer, const int16_t *samples, int coun
         }
 
         power = sqrtf(power) / count_f;
-        analyzer->peak[band] *= 0.995f;
+        analyzer->peak[band] *= PEAK_DECAY;
         if (power > analyzer->peak[band]) {
             analyzer->peak[band] = power;
         }
@@ -838,17 +858,30 @@ static void analyze_samples(Analyzer *analyzer, const int16_t *samples, int coun
             normalized = 1.0f;
         }
 
-        if (normalized > analyzer->level[band]) {
-            analyzer->level[band] = analyzer->level[band] * (1.0f - (float)LEVEL_ATTACK) +
-                                    normalized * (float)LEVEL_ATTACK;
+        if (normalized > analyzer->target[band]) {
+            analyzer->target[band] = normalized;
+        }
+    }
+}
+
+static void smooth_analyzer_levels(Analyzer *analyzer) {
+    int band;
+
+    for (band = 0; band < analyzer->bands; band++) {
+        float tgt = analyzer->target[band];
+        float delta = tgt - analyzer->level[band];
+
+        if (delta > 0.0f) {
+            analyzer->level[band] += LEVEL_ATTACK * delta;
         } else {
-            analyzer->level[band] = analyzer->level[band] * (1.0f - (float)LEVEL_RELEASE) +
-                                    normalized * (float)LEVEL_RELEASE;
+            analyzer->level[band] += LEVEL_RELEASE * delta;
         }
 
-        if (analyzer->level[band] < (float)LEVEL_FLOOR) {
+        if (analyzer->level[band] < LEVEL_FLOOR) {
             analyzer->level[band] = 0.0f;
         }
+
+        analyzer->target[band] = 0.0f;
     }
 }
 
@@ -871,13 +904,7 @@ static void animate_demo(Analyzer *analyzer, long now_ms) {
             target = 1.0;
         }
 
-        if (target > analyzer->level[band]) {
-            analyzer->level[band] = analyzer->level[band] * (1.0f - (float)LEVEL_ATTACK) +
-                                    (float)target * (float)LEVEL_ATTACK;
-        } else {
-            analyzer->level[band] = analyzer->level[band] * (1.0f - (float)LEVEL_RELEASE) +
-                                    (float)target * (float)LEVEL_RELEASE;
-        }
+        analyzer->target[band] = (float)target;
     }
 }
 
@@ -1804,6 +1831,7 @@ int main(int argc, char **argv) {
             }
             if (now >= next_render_ms) {
                 animate_demo(&analyzer, now);
+                smooth_analyzer_levels(&analyzer);
                 if (cfg.terminal) {
                     render_terminal_frame(&cfg, &analyzer);
                 } else {
@@ -1859,6 +1887,7 @@ int main(int argc, char **argv) {
         }
 
         if (now >= next_render_ms) {
+            smooth_analyzer_levels(&analyzer);
             if (cfg.terminal) {
                 render_terminal_frame(&cfg, &analyzer);
             } else {

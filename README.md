@@ -1,12 +1,16 @@
 # tinyEffects
 
-`tinyfx` is a small Linux EQ visualizer aimed at low-resource machines. It
-captures mono audio through ALSA, analyzes a small set of frequency bands, and
-draws a lightweight graphical X11 window by default. A terminal renderer is
-still available with `-T`.
+`tinyfx` is a small Linux EQ visualizer for low-resource machines. It captures
+mono audio through ALSA, analyzes a handful of frequency bands, and draws a
+lightweight X11 window (or an optional terminal view with `-T`).
 
-The first target is antiX on netbook-class hardware, so the defaults favor
-low sample rates, capped redraws, fixed buffers, and no terminal UI framework.
+Designed for netbook-class hardware (for example antiX on an Atom N455), with
+modest defaults for sample rate, redraw rate, and memory use.
+
+**Privacy:** `tinyfx` only reads audio from the ALSA device you choose. It does
+not send audio or metadata over the network, write recordings to disk, or call
+remote services. With `-M`, it runs the local `mocp` client to read the current
+track title from [MOC](https://moc.daper.net/).
 
 ## Requirements
 
@@ -101,7 +105,7 @@ Long forms are also available for palettes:
 Palette colors are mapped left-to-right by frequency. Audio energy controls
 brightness, so quiet sections use a dim version of the same palette color.
 The `neon` palette is inspired by cyan, pink, magenta, purple, and white neon
-sign colors. `soundsvall` is accepted as an alias for `neon`.
+sign colors.
 
 ## Capturing System Audio
 
@@ -142,8 +146,8 @@ current track with `-M` and display `Artist - Song` instead of fixed `-t` text:
 ```
 
 `mocp` must be installed and the MOC server should already be running. Metadata
-is refreshed about once per second. When nothing is playing, `-M` falls back to
-`-t` text if you provided it, otherwise bar mode is shown.
+is refreshed about every 2.5 seconds in the background. When nothing is playing,
+`-M` falls back to `-t` text if you provided it, otherwise bar mode is shown.
 
 Route MOC playback through the same ALSA loopback or monitor device you use for
 the EQ capture side.
@@ -193,3 +197,7 @@ make clean && make CFLAGS='-Os -pipe -march=atom'
 
 Fullscreen on a 1024x600 panel uses more pixels than the default window.
 Lower `-f` or `-b` before resizing the window down if CPU is tight.
+
+## License
+
+GNU General Public License v3.0 or later — see [LICENSE](LICENSE).
