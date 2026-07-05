@@ -55,7 +55,12 @@
 #define LEVEL_ATTACK 0.55f
 #define LEVEL_RELEASE 0.11f
 #define LEVEL_FLOOR 0.002f
+#define BAR_ATTACK 0.22f
+#define BAR_RELEASE 0.05f
 #define PEAK_DECAY 0.996f
+#define COLOR_DIM 0.0f
+#define COLOR_GAIN_GAMMA 1.4f
+#define BAR_HEIGHT_MAX 0.8f
 #define MOC_POLL_MS 2500
 #define MOC_LINE_MAX 512
 #define PI 3.14159265358979323846
@@ -130,6 +135,7 @@ typedef struct {
     float coeff[MAX_BANDS];
     float target[MAX_BANDS];
     float level[MAX_BANDS];
+    float bar_level[MAX_BANDS];
     float peak[MAX_BANDS];
     int bands;
 } Analyzer;
@@ -885,6 +891,25 @@ static void smooth_analyzer_levels(Analyzer *analyzer) {
     }
 }
 
+static void smooth_bar_levels(Analyzer *analyzer) {
+    int band;
+
+    for (band = 0; band < analyzer->bands; band++) {
+        float tgt = analyzer->level[band];
+        float delta = tgt - analyzer->bar_level[band];
+
+        if (delta > 0.0f) {
+            analyzer->bar_level[band] += BAR_ATTACK * delta;
+        } else {
+            analyzer->bar_level[band] += BAR_RELEASE * delta;
+        }
+
+        if (analyzer->bar_level[band] < LEVEL_FLOOR) {
+            analyzer->bar_level[band] = 0.0f;
+        }
+    }
+}
+
 static void animate_demo(Analyzer *analyzer, long now_ms) {
     double t = (double)now_ms / 1000.0;
     double sweep_left = 0.5 + 0.5 * sin(t * 0.75);
@@ -929,6 +954,42 @@ static double level_at_position(const Analyzer *analyzer, double pos) {
     mix = scaled - (double)left;
 
     return (double)analyzer->level[left] * (1.0 - mix) + (double)analyzer->level[right] * mix;
+}
+
+static double bar_level_at_position(const Analyzer *analyzer, double pos) {
+    double scaled;
+    int left;
+    int right;
+    double mix;
+
+    if (pos < 0.0) {
+        pos = 0.0;
+    } else if (pos > 1.0) {
+        pos = 1.0;
+    }
+
+    scaled = pos * (double)(analyzer->bands - 1);
+    left = (int)scaled;
+    right = left + 1;
+    if (right >= analyzer->bands) {
+        right = analyzer->bands - 1;
+    }
+    mix = scaled - (double)left;
+
+    return (double)analyzer->bar_level[left] * (1.0 - mix) +
+           (double)analyzer->bar_level[right] * mix;
+}
+
+static double bar_display_level(double level) {
+    float mix = (float)level;
+
+    if (mix < 0.0f) {
+        mix = 0.0f;
+    } else if (mix > 1.0f) {
+        mix = 1.0f;
+    }
+
+    return (double)(powf(mix, COLOR_GAIN_GAMMA) * BAR_HEIGHT_MAX);
 }
 
 static void write_repeat(char ch, int count) {
@@ -1020,21 +1081,22 @@ static Rgb visible_palette_base_color(const Palette *palette, double pos) {
 
 static Rgb palette_color(const Palette *palette, double pos, double level) {
     Rgb base = visible_palette_base_color(palette, pos);
-    double mix = level;
-    double dim = 0.18;
-    double gain;
+    float mix;
+    float gain;
     Rgb out;
 
-    if (mix < 0.0) {
-        mix = 0.0;
-    } else if (mix > 1.0) {
-        mix = 1.0;
+    mix = (float)level;
+    if (mix < 0.0f) {
+        mix = 0.0f;
+    } else if (mix > 1.0f) {
+        mix = 1.0f;
     }
 
-    gain = dim + (1.0 - dim) * mix;
-    out.r = (uint8_t)((double)base.r * gain);
-    out.g = (uint8_t)((double)base.g * gain);
-    out.b = (uint8_t)((double)base.b * gain);
+    mix = powf(mix, COLOR_GAIN_GAMMA);
+    gain = COLOR_DIM + (1.0f - COLOR_DIM) * mix;
+    out.r = (uint8_t)((float)base.r * gain);
+    out.g = (uint8_t)((float)base.g * gain);
+    out.b = (uint8_t)((float)base.b * gain);
     return out;
 }
 
@@ -1259,7 +1321,7 @@ static void draw_text_mode(const Config *cfg, const Analyzer *analyzer, TermSize
                 unsigned char ch = (unsigned char)text[i];
                 int glyph_width;
                 double pos = len == 1 ? 0.0 : (double)i / (double)(len - 1);
-                double level = level_at_position(analyzer, pos);
+                double level = bar_level_at_position(analyzer, pos);
                 int color = terminal_color_for(&cfg->palette, pos, level);
                 unsigned char fill;
                 const char **glyph;
@@ -1348,18 +1410,20 @@ static void draw_bar_mode(const Config *cfg, const Analyzer *analyzer, TermSize 
         printf("\033[%d;%dH", row_start + row, col_start);
         for (col = 0; col < draw_cols;) {
             double pos = draw_cols <= 1 ? 0.0 : (double)col / (double)(draw_cols - 1);
-            double level = level_at_position(analyzer, pos);
-            int height = (int)(level * usable_rows + 0.5);
+            double raw = bar_level_at_position(analyzer, pos);
+            double display = bar_display_level(raw);
+            int height = (int)(display * usable_rows + 0.5);
             int filled = height >= threshold;
-            int color = filled ? terminal_color_for(&cfg->palette, pos, level) : -1;
+            int color = filled ? terminal_color_for(&cfg->palette, pos, raw) : -1;
             int run = 1;
 
             while (col + run < draw_cols) {
                 double next_pos = draw_cols <= 1 ? 0.0 : (double)(col + run) / (double)(draw_cols - 1);
-                double next_level = level_at_position(analyzer, next_pos);
-                int next_height = (int)(next_level * usable_rows + 0.5);
+                double next_raw = bar_level_at_position(analyzer, next_pos);
+                double next_display = bar_display_level(next_raw);
+                int next_height = (int)(next_display * usable_rows + 0.5);
                 int next_filled = next_height >= threshold;
-                int next_color = next_filled ? terminal_color_for(&cfg->palette, next_pos, next_level) : -1;
+                int next_color = next_filled ? terminal_color_for(&cfg->palette, next_pos, next_raw) : -1;
 
                 if (next_filled != filled || next_color != color) {
                     break;
@@ -1648,12 +1712,13 @@ static void render_graphics_bars(Graphics *gfx, const Config *cfg, const Analyze
 
     for (i = 0; i < bars; i++) {
         double pos = bars == 1 ? 0.0 : (double)i / (double)(bars - 1);
-        double level = (double)analyzer->level[i];
-        int height = (int)(level * (double)(gfx->height - 12));
+        double raw = (double)analyzer->bar_level[i];
+        double display = bar_display_level(raw);
+        int height = (int)(display * (double)(gfx->height - 12));
         int x = gap + i * (bar_w + gap);
         int y = gfx->height - height - 6;
 
-        put_rect(gfx, x, y, bar_w, height, rgb_to_u32(palette_color(&cfg->palette, pos, level)));
+        put_rect(gfx, x, y, bar_w, height, rgb_to_u32(palette_color(&cfg->palette, pos, raw)));
     }
 }
 
@@ -1832,6 +1897,7 @@ int main(int argc, char **argv) {
             if (now >= next_render_ms) {
                 animate_demo(&analyzer, now);
                 smooth_analyzer_levels(&analyzer);
+                smooth_bar_levels(&analyzer);
                 if (cfg.terminal) {
                     render_terminal_frame(&cfg, &analyzer);
                 } else {
@@ -1888,6 +1954,7 @@ int main(int argc, char **argv) {
 
         if (now >= next_render_ms) {
             smooth_analyzer_levels(&analyzer);
+            smooth_bar_levels(&analyzer);
             if (cfg.terminal) {
                 render_terminal_frame(&cfg, &analyzer);
             } else {
